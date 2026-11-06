@@ -1,7 +1,7 @@
 # -*- test-case-name: klein.test.test_resource -*-
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from werkzeug.exceptions import HTTPException
@@ -15,6 +15,7 @@ from twisted.web.iweb import IRenderable, IRequest
 from twisted.web.resource import IResource, Resource, getChildForRequest
 from twisted.web.template import renderElement
 
+from ._audit import SOURCE, ResultCategory, build_request_context
 from ._dihttp import Response
 from ._interfaces import IKleinRequest
 
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
         KleinRouteHandler,
         RouteMetadata,
     )
+    from ._audit import IRenderAuditor
 
 
 def route_metadata(handler: KleinRouteHandler) -> RouteMetadata:
@@ -144,9 +146,12 @@ class KleinResource(Resource):
 
     isLeaf = True
 
-    def __init__(self, app: Klein) -> None:
+    def __init__(
+        self, app: Klein, auditor: IRenderAuditor | None = None
+    ) -> None:
         super().__init__()
         self._app = app
+        self._auditor = auditor
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, KleinResource):
@@ -179,7 +184,43 @@ class KleinResource(Resource):
                handlers
 
             6. render the thing that the error handler returned
+
+        Rendering may optionally be audited (see L{klein._audit}).
+        Auditing is strictly best-effort: this method builds a redacted
+        request context once and every audit emission is guarded so
+        that no audit failure, synchronous or asynchronous, can alter
+        any of the six steps above.
         """
+        auditor = self._auditor
+        audit_context: Mapping[str, Any] | None = None
+        if auditor is not None:
+            try:
+                audit_context = build_request_context(request)
+            except Exception:
+                log.err(None, "Failed to build audit request context.")
+                audit_context = None
+
+        def _audit(
+            category: str,
+            source: str,
+            detail: Mapping[str, Any] | None = None,
+        ) -> None:
+            # Defensive on top of RenderAuditor.record's own guards:
+            # auditing must never affect the rendering main flow.
+            if auditor is None:
+                return
+            try:
+                auditor.record(
+                    source,
+                    category,
+                    context=audit_context,
+                    detail=detail,
+                )
+            except Exception:
+                log.err(None, "Audit recording failed.")
+
+        _audit(ResultCategory.RENDER_STARTED.value, SOURCE.RENDER_START)
+
         try:
             (
                 url_scheme,
@@ -191,6 +232,11 @@ class KleinResource(Resource):
         except URLDecodeError as e:
             for what, fail in e.errors:
                 log.err(fail, f"Invalid encoding in {what}.")
+            _audit(
+                ResultCategory.URL_DECODE_FAILED.value,
+                SOURCE.URL_DECODE,
+                {"components": [what for what, fail in e.errors]},
+            )
             request.setResponseCode(400)
             return b"Non-UTF-8 encoding in URL."
 
@@ -209,6 +255,11 @@ class KleinResource(Resource):
         # Make sure we'll notice when the connection goes away unambiguously.
         request_finished = [False]
 
+        # Audit bookkeeping: which endpoint matched (if any), and the
+        # type name of the failure currently being processed (if any).
+        matched_endpoint: list[str | None] = [None]
+        failure_name: list[str | None] = [None]
+
         def _finish(result: object) -> None:
             request_finished[0] = True
 
@@ -219,6 +270,7 @@ class KleinResource(Resource):
             # one of our defaults.
             rule, kwargs = mapper.match(return_rule=True)
             endpoint = rule.endpoint
+            matched_endpoint[0] = endpoint
 
             # Try pretty hard to fix up prepath and postpath.
             segment_count = route_metadata(
@@ -285,7 +337,17 @@ class KleinResource(Resource):
             # processing.  We don't return failure here because there
             # is no way to surface this failure to the user if the
             # request is finished.
+            failure_name[0] = getattr(failure.type, "__name__", None)
+
             if request_finished[0]:
+                _audit(
+                    ResultCategory.RENDER_INTERRUPTED.value,
+                    SOURCE.PROCESSING_FAILED,
+                    {
+                        "cancelled": bool(failure.check(defer.CancelledError)),
+                        "error": failure_name[0],
+                    },
+                )
                 # TODO: coverage
                 if not failure.check(defer.CancelledError):  # pragma: no branch
                     log.err(
@@ -310,6 +372,11 @@ class KleinResource(Resource):
                     encoded = resp.iter_encoded()
                     return succeed(ensure_utf8_bytes(b"".join(encoded)))
                 else:
+                    _audit(
+                        ResultCategory.ERROR_UNHANDLED.value,
+                        SOURCE.PROCESSING_FAILED,
+                        {"error": failure_name[0]},
+                    )
                     request.processingFailed(  # type: ignore[attr-defined]
                         failure,
                     )
@@ -339,6 +406,27 @@ class KleinResource(Resource):
         def write_response(
             r: _StandInResource | str | bytes | int | None,
         ) -> None:
+            # On the interrupted path processing_failed already emitted
+            # a terminal event and the request is gone; do not double up.
+            if not request_finished[0]:
+                terminal_detail: dict[str, Any] = {
+                    "delegated": r is StandInResource,
+                    "endpoint": matched_endpoint[0],
+                }
+                response_code = getattr(request, "code", None)
+                if response_code is not None:
+                    terminal_detail["response_code"] = response_code
+                if failure_name[0] is not None:
+                    terminal_detail["error"] = failure_name[0]
+                    terminal_category = ResultCategory.ERROR_HANDLED.value
+                else:
+                    terminal_category = ResultCategory.RENDERED.value
+                _audit(
+                    terminal_category,
+                    SOURCE.RESPONSE,
+                    terminal_detail,
+                )
+
             if r is StandInResource:
                 return
 

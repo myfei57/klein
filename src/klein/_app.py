@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from inspect import iscoroutine
 from typing import (
     IO,
+    TYPE_CHECKING,
     Any,
     Optional,
     Protocol,
@@ -39,6 +40,9 @@ from ._decorators import modified, named
 from ._interfaces import IKleinRequest, KleinQueryValue
 from ._paramspec_workaround import _normalFunction, _werkzeugRuleArgs
 from ._resource import KleinResource, route_metadata
+
+if TYPE_CHECKING:
+    from ._audit import IRenderAuditor
 
 _KleinSynchronousRenderable = Union[
     str, bytes, IResource, IRenderable, Tag, None
@@ -248,14 +252,25 @@ class Klein:
         """
         return handler(self._instance, request, failure)
 
-    def resource(self) -> KleinResource:
+    def resource(self, auditor: IRenderAuditor | None = None) -> KleinResource:
         """
         Return an L{IResource} which suitably wraps this app.
+
+        @param auditor: An optional L{klein._audit.IRenderAuditor}
+            recording a versioned audit trail of resource rendering;
+            use L{klein._audit.RenderAuditor} as the production
+            implementation.  Auditing is best-effort and never affects
+            request handling.
 
         @returns: An L{IResource}
         """
 
-        return KleinResource(self)
+        if auditor is None:
+            # Preserve the exact historical call shape so mocks and
+            # equality checks that expect a single argument are
+            # unaffected when auditing is not in use.
+            return KleinResource(self)
+        return KleinResource(self, auditor)
 
     def __get__(self, instance: Any, owner: object) -> Klein:
         """
