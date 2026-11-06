@@ -1,6 +1,12 @@
 NEWS
 ====
 
+Unreleased
+----------
+
+ * Added a compatibility migration command, ``klein.migrate_resource_rendering``, which upgrades legacy Klein resource-rendering structures to a target schema version through a registered chain of version steps, reporting one ``FieldRecord`` per field action, preserving unknown fields, and leaving the input untouched on failure.  Migrations are idempotent, skip intermediate versions, flag field conflicts and corrupt input, and keep the originating request on asynchronous transform failures so they can be retried.
+
+
 23.12.0 - 2023-12-22
 --------------------
 
