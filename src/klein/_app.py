@@ -35,6 +35,7 @@ from twisted.web.resource import IResource
 from twisted.web.server import Request, Site
 from twisted.web.template import Tag
 
+from ._budgets import BudgetedRender
 from ._decorators import modified, named
 from ._interfaces import IKleinRequest, KleinQueryValue
 from ._paramspec_workaround import _normalFunction, _werkzeugRuleArgs
@@ -152,9 +153,11 @@ def buildURL(
 @implementer(IKleinRequest)
 class KleinRequest:
     mapper: MapAdapter
+    execution_budget: BudgetedRender | None
 
     def __init__(self, request: Request) -> None:
         self.branch_segments = [""]
+        self.execution_budget = None
 
     def url_for(
         self,

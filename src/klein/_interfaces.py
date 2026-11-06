@@ -18,6 +18,10 @@ KleinQueryValue = Union[str, int, float]
 class IKleinRequest(Interface):
     branch_segments = Attribute("Segments consumed by a branch route.")
     mapper = Attribute("L{werkzeug.routing.MapAdapter}")
+    execution_budget = Attribute(
+        "The active budgeted render controller, or C{None} when the "
+        "request is being rendered without an execution budget."
+    )
 
     def url_for(
         endpoint: str,
